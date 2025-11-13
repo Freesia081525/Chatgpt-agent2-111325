@@ -4,6 +4,7 @@ import json
 import time
 import yaml
 import base64
+import re
 import pdfplumber
 import streamlit as st
 from typing import Optional, Dict, Any, List
@@ -240,7 +241,7 @@ def initialize_session_state():
     st.session_state.initialized = True
     
     # --- API Keys and Sources ---
-    st.session_state.api_keys = {}  # FIX: Renamed from 'keys' to 'api_keys'
+    st.session_state.api_keys = {}
     st.session_state.key_sources = {}
     
     key_configs = {
@@ -251,10 +252,10 @@ def initialize_session_state():
     
     for key, env_value in key_configs.items():
         if env_value:
-            st.session_state.api_keys[key] = env_value  # FIX: Use 'api_keys'
+            st.session_state.api_keys[key] = env_value
             st.session_state.key_sources[key] = "env"
         else:
-            st.session_state.api_keys[key] = ""  # FIX: Use 'api_keys'
+            st.session_state.api_keys[key] = ""
             st.session_state.key_sources[key] = "user"
             
     # --- Other State Variables ---
@@ -263,10 +264,14 @@ def initialize_session_state():
     st.session_state.yaml_text = ""
     st.session_state.doc1_text = ""
     st.session_state.doc2_text = ""
+    st.session_state.doc1_bytes = None
+    st.session_state.doc2_bytes = None
     st.session_state.trace = []
     st.session_state.outputs = {}
     st.session_state.results_json = {}
     st.session_state.run_metrics = []
+    st.session_state.summary_markdown = ""
+    st.session_state.custom_keywords = []
 
 def render_sidebar():
     """
@@ -282,9 +287,9 @@ def render_sidebar():
         if st.session_state.key_sources.get("GOOGLE_API_KEY") == "env":
             st.success("Gemini: Using environment key")
         else:
-            st.session_state.api_keys["GOOGLE_API_KEY"] = st.text_input(  # FIX: Use 'api_keys'
+            st.session_state.api_keys["GOOGLE_API_KEY"] = st.text_input(
                 "GOOGLE_API_KEY (Gemini)",
-                value=st.session_state.api_keys.get("GOOGLE_API_KEY", ""),  # FIX: Use 'api_keys'
+                value=st.session_state.api_keys.get("GOOGLE_API_KEY", ""),
                 type="password"
             )
 
@@ -292,9 +297,9 @@ def render_sidebar():
         if st.session_state.key_sources.get("OPENAI_API_KEY") == "env":
             st.success("OpenAI: Using environment key")
         else:
-            st.session_state.api_keys["OPENAI_API_KEY"] = st.text_input(  # FIX: Use 'api_keys'
+            st.session_state.api_keys["OPENAI_API_KEY"] = st.text_input(
                 "OPENAI_API_KEY (OpenAI-compatible)",
-                value=st.session_state.api_keys.get("OPENAI_API_KEY", ""),  # FIX: Use 'api_keys'
+                value=st.session_state.api_keys.get("OPENAI_API_KEY", ""),
                 type="password"
             )
 
@@ -302,9 +307,9 @@ def render_sidebar():
         if st.session_state.key_sources.get("XAI_API_KEY") == "env":
             st.success("Grok: Using environment key")
         else:
-            st.session_state.api_keys["XAI_API_KEY"] = st.text_input(  # FIX: Use 'api_keys'
+            st.session_state.api_keys["XAI_API_KEY"] = st.text_input(
                 "XAI_API_KEY (Grok)",
-                value=st.session_state.api_keys.get("XAI_API_KEY", ""),  # FIX: Use 'api_keys'
+                value=st.session_state.api_keys.get("XAI_API_KEY", ""),
                 type="password"
             )
             
@@ -319,7 +324,7 @@ def render_documents_tab(tab):
 
         def read_pdf(file) -> str:
             try:
-                text_parts = [page.extract_text() or "" for page in pdfplumber.open(file).pages]
+                text_parts = [page.extract_text() or "" for page in pdfplumber.open(io.BytesIO(file)).pages]
                 return "\n".join(text_parts)
             except Exception:
                 return ""
@@ -328,24 +333,41 @@ def render_documents_tab(tab):
             st.subheader("Document A")
             uploaded1 = st.file_uploader("Upload PDF/TXT for Document A", type=["pdf", "txt"], key="doc1_upl")
             if uploaded1:
+                st.session_state.doc1_bytes = uploaded1.getvalue()
                 if uploaded1.name.lower().endswith(".pdf"):
-                    st.session_state.doc1_text = read_pdf(uploaded1)
+                    st.session_state.doc1_text = read_pdf(st.session_state.doc1_bytes)
                 else:
-                    st.session_state.doc1_text = uploaded1.read().decode("utf-8", errors="ignore")
-            st.session_state.doc1_text = st.text_area("Or paste text for Document A", st.session_state.doc1_text, height=280)
+                    st.session_state.doc1_text = st.session_state.doc1_bytes.decode("utf-8", errors="ignore")
+            
+            with st.expander("Preview Document A", expanded=True):
+                if st.session_state.doc1_bytes and "pdf" in uploaded1.type:
+                    st.write("PDF Preview:")
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64.b64encode(st.session_state.doc1_bytes).decode()}" width="100%" height="400"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
+                elif st.session_state.doc1_text:
+                    st.text_area("Text Preview", st.session_state.doc1_text, height=250, disabled=True)
+                else:
+                    st.info("Upload a document to see a preview.")
 
         with col2:
             st.subheader("Document B")
             uploaded2 = st.file_uploader("Upload PDF/TXT for Document B", type=["pdf", "txt"], key="doc2_upl")
             if uploaded2:
+                st.session_state.doc2_bytes = uploaded2.getvalue()
                 if uploaded2.name.lower().endswith(".pdf"):
-                    st.session_state.doc2_text = read_pdf(uploaded2)
+                    st.session_state.doc2_text = read_pdf(st.session_state.doc2_bytes)
                 else:
-                    st.session_state.doc2_text = uploaded2.read().decode("utf-8", errors="ignore")
-            st.session_state.doc2_text = st.text_area("Or paste text for Document B", st.session_state.doc2_text, height=280)
+                    st.session_state.doc2_text = st.session_state.doc2_bytes.decode("utf-8", errors="ignore")
 
-        ready = bool(st.session_state.doc1_text and st.session_state.doc2_text)
-        st.info("Ready for processing." if ready else "Please provide both documents.")
+            with st.expander("Preview Document B", expanded=True):
+                if st.session_state.doc2_bytes and "pdf" in uploaded2.type:
+                    st.write("PDF Preview:")
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64.b64encode(st.session_state.doc2_bytes).decode()}" width="100%" height="400"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
+                elif st.session_state.doc2_text:
+                    st.text_area("Text Preview", st.session_state.doc2_text, height=250, disabled=True)
+                else:
+                    st.info("Upload a document to see a preview.")
 
 def render_pipeline_tab(tab):
     """Renders the UI for the Pipeline tab."""
@@ -356,11 +378,9 @@ def render_pipeline_tab(tab):
             upload_yaml = st.file_uploader("Upload agents.yaml", type=["yaml", "yml"])
             if upload_yaml:
                 st.session_state.yaml_text = upload_yaml.read().decode("utf-8")
-                # When a new file is uploaded, reload agents from it
                 data = yaml.safe_load(st.session_state.yaml_text)
                 st.session_state.agents = data.get("pipeline", [])
             
-            # Load default YAML only once if no agents are loaded yet
             if not st.session_state.agents and os.path.exists(DEFAULT_YAML_PATH):
                 with open(DEFAULT_YAML_PATH, "r", encoding="utf-8") as f:
                     st.session_state.yaml_text = f.read()
@@ -400,7 +420,7 @@ def render_run_tab(tab):
     """Renders the UI for the Run tab and executes the pipeline."""
     with tab:
         st.header("Execute")
-        keys = st.session_state.api_keys  # FIX: Use 'api_keys'
+        keys = st.session_state.api_keys
         agents = st.session_state.agents
         
         missing_keys = set()
@@ -438,6 +458,7 @@ def render_run_tab(tab):
             base_context = {"doc1": st.session_state.doc1_text, "doc2": st.session_state.doc2_text}
             result_ctx = run_chain(st.session_state.agents, router, base_context, on_step=on_step)
             st.session_state.outputs = result_ctx.get("outputs", {})
+            st.session_state.summary_markdown = st.session_state.outputs.get("summary_markdown", "No summary was generated.")
             status.update(label="Run finished", state="complete", expanded=False)
 
             final_json_str = st.session_state.outputs.get("final_json", "{}")
@@ -453,6 +474,89 @@ def render_run_tab(tab):
         for t in st.session_state.trace:
             color = {"success": "green", "error": "red"}.get(t["status"], "orange")
             st.markdown(f"- [{t['index']}] <span style='color:{color}'>{t['status']}</span> — {t['name']} ({t['provider']}/{t['model']})", unsafe_allow_html=True)
+
+def render_summary_tab(tab):
+    """Renders the UI for the Summary and Interactive Analysis tab."""
+    with tab:
+        st.header("Summary and Analysis")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.subheader("Keyword Highlighting")
+            default_keywords_str = st.text_input("Default Keywords (comma-separated)", "data, AI, model, analysis, risk")
+            default_keywords = [k.strip() for k in default_keywords_str.split(",") if k.strip()]
+            
+            # Custom keywords
+            with st.form("custom_keywords_form"):
+                kw_text = st.text_input("Add Custom Keyword")
+                kw_color = st.color_picker("Choose Color", "#FFDDC1")
+                if st.form_submit_button("Add Keyword"):
+                    if kw_text:
+                        st.session_state.custom_keywords.append({"text": kw_text, "color": kw_color})
+
+            for i, kw in enumerate(st.session_state.custom_keywords):
+                cols = st.columns([0.6, 0.3, 0.1])
+                cols[0].markdown(f"<span style='background-color:{kw['color']}; padding: 2px 5px; border-radius: 5px;'>{kw['text']}</span>", unsafe_allow_html=True)
+                cols[1].write(kw["color"])
+                if cols[2].button("X", key=f"del_kw_{i}"):
+                    st.session_state.custom_keywords.pop(i)
+                    st.experimental_rerun()
+
+        with col2:
+            st.subheader("Interactive Agent Analysis")
+            if not st.session_state.agents:
+                st.warning("No agents defined in pipeline.")
+                return
+
+            agent_options = {f"[{i+1}] {ag.get('name')}": i for i, ag in enumerate(st.session_state.agents)}
+            selected_agent_name = st.selectbox("Select Agent for Analysis", options=list(agent_options.keys()))
+            
+            if selected_agent_name:
+                agent_idx = agent_options[selected_agent_name]
+                selected_agent = st.session_state.agents[agent_idx].copy()
+
+                st.text_input("Model", selected_agent.get("model", ""), key="analysis_model", disabled=True)
+                analysis_prompt = st.text_area("Analysis Prompt", "Analyze the following summary and provide your insights:\n\n---\n\n{{ summary }}", height=150)
+                
+                if st.button("Analyze Summary with Selected Agent"):
+                    if not st.session_state.summary_markdown:
+                        st.error("There is no summary to analyze.")
+                    else:
+                        router = ProviderRouter(
+                            google_api_key=st.session_state.api_keys.get("GOOGLE_API_KEY"),
+                            openai_api_key=st.session_state.api_keys.get("OPENAI_API_KEY"),
+                            xai_api_key=st.session_state.api_keys.get("XAI_API_KEY")
+                        )
+                        final_prompt = render_template(analysis_prompt, {"summary": st.session_state.summary_markdown})
+                        
+                        with st.spinner(f"Running analysis with {selected_agent_name}..."):
+                            resp = router.call(
+                                provider=selected_agent["provider"],
+                                model=selected_agent["model"],
+                                system_prompt="You are a helpful analysis assistant.",
+                                user_prompt=final_prompt,
+                                temperature=selected_agent.get("temperature", 0.2),
+                                max_tokens=selected_agent.get("max_tokens", 2048)
+                            )
+                            st.session_state.analysis_result = resp.get("text", "No result from analysis.")
+
+        st.markdown("---")
+        st.subheader("Generated Summary")
+        st.session_state.summary_markdown = st.text_area("Edit summary content here:", st.session_state.summary_markdown, height=250)
+        
+        # Highlight keywords in the summary
+        display_summary = st.session_state.summary_markdown
+        all_keywords = [{"text": k, "color": "#FF6347"} for k in default_keywords] + st.session_state.custom_keywords
+        
+        for kw in all_keywords:
+            pattern = re.compile(f"({re.escape(kw['text'])})", re.IGNORECASE)
+            display_summary = pattern.sub(f"<span style='background-color:{kw['color']}; padding: 2px 5px; border-radius: 5px;'>\\1</span>", display_summary)
+        
+        st.markdown(display_summary, unsafe_allow_html=True)
+
+        if "analysis_result" in st.session_state:
+            st.subheader("Analysis Result")
+            st.markdown(st.session_state.analysis_result)
 
 def render_dashboard_tab(tab):
     """Renders the UI for the interactive Dashboard tab."""
@@ -531,11 +635,14 @@ def main():
 
     st.title("Agentic AI Document Comparison System")
     
-    doc_tab, pipe_tab, run_tab, dash_tab, yaml_tab = st.tabs(["Documents", "Pipeline", "Run", "Dashboard", "YAML"])
+    doc_tab, pipe_tab, run_tab, summary_tab, dash_tab, yaml_tab = st.tabs([
+        "Documents", "Pipeline", "Run", "Summary", "Dashboard", "YAML"
+    ])
     
     render_documents_tab(doc_tab)
     render_pipeline_tab(pipe_tab)
     render_run_tab(run_tab)
+    render_summary_tab(summary_tab)
     render_dashboard_tab(dash_tab)
     render_yaml_tab(yaml_tab)
 

@@ -156,7 +156,7 @@ def run_chain(agents: List[Dict[str, Any]], router, base_context: Dict[str, Any]
             sys_prompt = render_template(system_prompt, context)
 
             resp = router.call(
-                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-2.5-flash"),
+                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-1.5-flash"),
                 system_prompt=sys_prompt, user_prompt=user_prompt,
                 temperature=temperature, max_tokens=max_tokens
             )
@@ -232,45 +232,82 @@ def wow_status_badge(status: str):
 DEFAULT_YAML_PATH = "agents.yaml"
 
 def initialize_session_state():
-    """Sets up the default values for the session state."""
-    defaults = {
-        "ctx": {},
-        "agents": [],
-        "yaml_text": "",
-        "keys": {
-            "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
-            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
-            "XAI_API_KEY": os.getenv("XAI_API_KEY"),
-        },
-        "doc1_text": "", "doc2_text": "",
+    """
+    Sets up the default values for the session state.
+    This now includes tracking the source of API keys (environment or user).
+    """
+    # Initialize basic structure if not present
+    if "keys" not in st.session_state:
+        st.session_state.keys = {}
+    if "key_sources" not in st.session_state:
+        st.session_state.key_sources = {}
+    
+    # Define the keys we are interested in
+    key_configs = {
+        "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
+        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+        "XAI_API_KEY": os.getenv("XAI_API_KEY"),
+    }
+
+    # Populate keys and their sources only on the first run
+    for key, env_value in key_configs.items():
+        if key not in st.session_state.key_sources:
+            if env_value:
+                st.session_state.keys[key] = env_value
+                st.session_state.key_sources[key] = "env"
+            else:
+                st.session_state.keys[key] = ""
+                st.session_state.key_sources[key] = "user"
+
+    # Initialize other session state variables
+    other_defaults = {
+        "ctx": {}, "agents": [], "yaml_text": "", "doc1_text": "", "doc2_text": "",
         "trace": [], "outputs": {}, "results_json": {}, "run_metrics": []
     }
-    for key, value in defaults.items():
+    for key, value in other_defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 def render_sidebar():
-    """Renders the sidebar for API key input."""
+    """
+    Renders the sidebar. It conditionally shows API key input fields
+    only if the key was not found in the environment variables.
+    """
     with st.sidebar:
         st.title("Settings")
         st.caption("Agentic AI Document Comparison (Streamlit)")
         st.subheader("API Keys")
-        keys = st.session_state.keys
         
-        if not keys["GOOGLE_API_KEY"]:
-            keys["GOOGLE_API_KEY"] = st.text_input("GOOGLE_API_KEY (Gemini)", type="password")
-        else:
+        # Gemini / Google
+        if st.session_state.key_sources.get("GOOGLE_API_KEY") == "env":
             st.success("Gemini: Using environment key")
-
-        if not keys["OPENAI_API_KEY"]:
-            keys["OPENAI_API_KEY"] = st.text_input("OPENAI_API_KEY (OpenAI-compatible)", type="password")
         else:
+            st.session_state.keys["GOOGLE_API_KEY"] = st.text_input(
+                "GOOGLE_API_KEY (Gemini)",
+                value=st.session_state.keys.get("GOOGLE_API_KEY", ""),
+                type="password"
+            )
+
+        # OpenAI
+        if st.session_state.key_sources.get("OPENAI_API_KEY") == "env":
             st.success("OpenAI: Using environment key")
-
-        if not keys["XAI_API_KEY"]:
-            keys["XAI_API_KEY"] = st.text_input("XAI_API_KEY (Grok)", type="password")
         else:
+            st.session_state.keys["OPENAI_API_KEY"] = st.text_input(
+                "OPENAI_API_KEY (OpenAI-compatible)",
+                value=st.session_state.keys.get("OPENAI_API_KEY", ""),
+                type="password"
+            )
+
+        # XAI / Grok
+        if st.session_state.key_sources.get("XAI_API_KEY") == "env":
             st.success("Grok: Using environment key")
+        else:
+            st.session_state.keys["XAI_API_KEY"] = st.text_input(
+                "XAI_API_KEY (Grok)",
+                value=st.session_state.keys.get("XAI_API_KEY", ""),
+                type="password"
+            )
+            
         st.markdown("---")
         st.caption("Models will be selected per-agent in the Pipeline tab.")
 
@@ -335,9 +372,9 @@ def render_pipeline_tab(tab):
                     ag["provider"] = st.selectbox("Provider", prov_options, index=prov_options.index(ag.get("provider", "gemini")), key=f"prov_{idx}")
                     
                     model_options = {
-                        "gemini": ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"],
-                        "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5-nano"],
-                        "grok": ["grok-4-fast-reasoning", "grok-3-mini"]
+                        "gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"],
+                        "openai": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+                        "grok": ["grok-1.5", "grok-1"]
                     }.get(ag["provider"], [])
                     
                     ag["model"] = st.selectbox("Model", model_options, index=0, key=f"model_{idx}")
@@ -363,21 +400,25 @@ def render_run_tab(tab):
         st.header("Execute")
         keys = st.session_state.keys
         agents = st.session_state.agents
-        missing_keys = [
-            "GOOGLE_API_KEY" for ag in agents if ag.get("provider") == "gemini" and not keys["GOOGLE_API_KEY"]
-        ] + [
-            "OPENAI_API_KEY" for ag in agents if ag.get("provider") == "openai" and not keys["OPENAI_API_KEY"]
-        ] + [
-            "XAI_API_KEY" for ag in agents if ag.get("provider") == "grok" and not keys["XAI_API_KEY"]
-        ]
+        
+        # Check for missing keys based on the providers actually used in the pipeline
+        missing_keys = set()
+        providers_in_use = {ag.get("provider") for ag in agents}
+        
+        if "gemini" in providers_in_use and not keys.get("GOOGLE_API_KEY"):
+            missing_keys.add("GOOGLE_API_KEY")
+        if "openai" in providers_in_use and not keys.get("OPENAI_API_KEY"):
+            missing_keys.add("OPENAI_API_KEY")
+        if "grok" in providers_in_use and not keys.get("XAI_API_KEY"):
+            missing_keys.add("XAI_API_KEY")
 
-        if set(missing_keys):
-            st.error(f"Missing API keys for providers in pipeline: {', '.join(set(missing_keys))}")
+        if missing_keys:
+            st.error(f"Missing API keys for providers in pipeline: {', '.join(missing_keys)}")
         
         if st.button("Run Agent Pipeline", type="primary", disabled=not (st.session_state.doc1_text and st.session_state.doc2_text)):
             st.session_state.trace, st.session_state.outputs, st.session_state.results_json, st.session_state.run_metrics = [], {}, {}, []
             status = st.status("Running agents...", expanded=True)
-            router = ProviderRouter(google_api_key=keys["GOOGLE_API_KEY"], openai_api_key=keys["OPENAI_API_KEY"], xai_api_key=keys["XAI_API_KEY"])
+            router = ProviderRouter(google_api_key=keys.get("GOOGLE_API_KEY"), openai_api_key=keys.get("OPENAI_API_KEY"), xai_api_key=keys.get("XAI_API_KEY"))
 
             def on_step(step):
                 with status:

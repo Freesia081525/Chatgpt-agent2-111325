@@ -1,406 +1,554 @@
-agents:
-  - name: 藥品基本資訊提取器
-    description: 提取藥品名稱、成分、劑型、規格等基本資訊
+version: 1
+pipeline:
+
+  # ──────────────── 01 | 案件與分類前置 ────────────────
+  - id: fda_scope_classifier
+    name: 受理範疇與產品分類判定器（FDA）
+    provider: openai
+    model: gpt-4o-mini
+    temperature: 0.1
+    max_tokens: 1536
+    output_key: scope_class
     system_prompt: |
-      你是FDA文件分析專家，專注於提取藥品基本資訊。
-      - 準確識別：藥品名稱（商品名、學名）、活性成分、劑型、規格、包裝
-      - 標註不確定項目，保留原文引用
-      - 以結構化格式輸出（表格或JSON）
-    user_prompt: "請從以下文件中提取藥品基本資訊："
+      你負責根據產品描述、適應症、使用環境、是否含藥、是否植入等，判定是否屬於美國 FDA 醫療器材範疇與可能的管制等級（Class I/II/III）。
+    prompt: |
+      請輸出JSON：
+      {"is_medical_device":true/false,"rationale":"...","likely_class":"I|II|III","assumptions":["..."]}
+      產品摘要：{{ device_summary }}
+
+  - id: fda_product_code_matcher
+    name: 產品代碼與規範編碼對應器（Product Code/Regulation Number）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: prod_code_map
+    system_prompt: |
+      解析可能的產品代碼(Product Code)與規範編號(21 CFR Part/Section)，並列出依據。
+    prompt: |
+      請輸出JSON：
+      {"candidates":[{"product_code":"...","21cfr":"...","rationale":"..."}],"confidence":0.x}
+      產品與適應症：{{ device_summary }}
+
+  - id: fda_submission_path_selector
+    name: 申請途徑建議器（510(k)/De Novo/PMA/Q-Sub）
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: submission_path
+    system_prompt: |
+      依據產品風險、可比性、創新程度判定可能的申請途徑與理由。
+    prompt: |
+      請輸出JSON：
+      {"recommended":"510k|DeNovo|PMA|QSub","alternatives":["..."],"rationale":"...","confidence":0.x}
+      產品摘要：{{ device_summary }}
+      可比性資訊：{{ predicate_info }}
+
+  # ──────────────── 02 | Predicate 與實質等同性（510(k)） ────────────────
+  - id: fda_predicate_relevance
+    name: 實質等同性關聯檢查器（Predicate Fit）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 2048
+    output_key: predicate_fit
+    system_prompt: |
+      比對新器材與參考器材的預期用途、技術特性、材料、效能指標，標記差異。
+    prompt: |
+      請輸出JSON：
+      {"matches":["..."],"differences":[{"aspect":"...","impact":"低|中|高"}],"conclusion":"..."}
+      新器材：{{ device_details_A }}
+      參考器材：{{ device_details_B }}
+
+  - id: fda_substantial_equivalence_matrix
+    name: 實質等同性矩陣產生器（510(k)）
+    provider: openai
     model: gpt-4o-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 適應症與用法用量分析器
-    description: 分析適應症、用法用量、給藥途徑
+    max_tokens: 2048
+    output_key: se_matrix
     system_prompt: |
-      你是臨床用藥專家，專注於適應症與用法分析。
-      - 提取：適應症、用法用量、給藥途徑、特殊族群用藥
-      - 區分成人與兒童劑量
-      - 標註禁忌症與限制
-    user_prompt: "請分析以下文件的適應症與用法用量："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
+      建立項目對齊矩陣（預期用途、技術、性能、安全性）與等同性判斷。
+    prompt: |
+      請輸出JSON：
+      {"labels_A":[...],"labels_B":[...],"matrix":[[...]],"SE_summary":"SUPPORTED|INSUFFICIENT"}
+      A：{{ device_details_A }}
+      B：{{ device_details_B }}
 
-  - name: 不良反應評估器
-    description: 系統性評估藥品不良反應與安全性
+  # ──────────────── 03 | 風險管理（ISO 14971）與人因可用性 ────────────────
+  - id: iso14971_hazard_id
+    name: 危害識別與初步風險矩陣（ISO 14971）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 2048
+    output_key: hazards
     system_prompt: |
-      你是藥物安全專家，專注於不良反應評估。
-      - 分類：常見、罕見、嚴重不良反應
-      - 標註發生率、嚴重程度、處置方式
-      - 識別黑框警語（Black Box Warning）
-    user_prompt: "請評估以下文件中的不良反應資訊："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1500
+      依據使用流程與失效模式列出危害、可預見誤用、嚴重度/發生率初評。
+    prompt: |
+      請輸出JSON：
+      {"hazards":[{"id":"H1","description":"...","severity":"S1-5","probability":"P1-5"}],"assumptions":["..."]}
+      使用情境：{{ use_scenarios }}
 
-  - name: 藥物交互作用分析器
-    description: 識別藥物-藥物、藥物-食物交互作用
+  - id: human_factors_plan
+    name: 人因工程與可用性評估規劃器（HFE/UES）
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: hfe_plan
     system_prompt: |
-      你是臨床藥學專家，專注於交互作用分析。
-      - 識別：藥物-藥物、藥物-食物、藥物-疾病交互作用
-      - 評估臨床意義與處置建議
-      - 標註禁止併用與謹慎併用項目
-    user_prompt: "請分析以下文件的藥物交互作用："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
+      輸出人因工程驗證計畫骨架：使用者群、關鍵任務、測試場景、成功準則。
+    prompt: |
+      請輸出Markdown章節（簡要要點清單）。
+      產品：{{ device_summary }}
+      關鍵任務：{{ critical_tasks }}
 
-  - name: 禁忌症與警語提取器
-    description: 提取禁忌症、警語、注意事項
+  - id: risk_controls_mapper
+    name: 風險控制對策映射器（設計/保護/資訊）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: risk_controls
     system_prompt: |
-      你是藥品安全管理專家。
-      - 提取：絕對禁忌、相對禁忌、特殊警語
-      - 區分不同嚴重程度
-      - 標註特殊族群注意事項（孕婦、哺乳、兒童、老年）
-    user_prompt: "請提取以下文件的禁忌症與警語："
+      將危害與控制對策對齊（設計變更、保護措施、標示/IFU資訊）。
+    prompt: |
+      請輸出JSON：
+      {"controls":[{"hazard_id":"H1","type":"設計|保護|資訊","measure":"...","residual_risk":"低|中|高"}]}
+      危害清單：{{ hazards }}
+
+  # ──────────────── 04 | 生物相容性與材料 ────────────────
+  - id: biocompatibility_profile_builder
+    name: 生物相容性接觸概況生成器（ISO 10993 路徑）
+    provider: openai
     model: gpt-4o-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 藥動學參數提取器
-    description: 提取吸收、分布、代謝、排泄（ADME）資訊
+    max_tokens: 1536
+    output_key: bio_profile
     system_prompt: |
-      你是臨床藥理學專家。
-      - 提取：生體可用率、半衰期、清除率、分布體積
-      - 識別代謝酵素（CYP450等）、排泄途徑
-      - 以表格呈現藥動學參數
-    user_prompt: "請提取以下文件的藥動學參數："
+      根據接觸類型與時長（表面/外周/植入，接觸短/長期）建議測試矩陣。
+    prompt: |
+      請輸出JSON：
+      {"contact_type":"...","duration":"...","tests":[{"name":"...","rationale":"..."}]}
+      材料與接觸資訊：{{ material_contact }}
+
+  - id: materials_change_impact
+    name: 材料與製程變更影響評估器
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: mat_change_impact
+    system_prompt: |
+      評估材料或製程變更對安全/性能/生物相容性之影響與補充測試需求。
+    prompt: |
+      請輸出JSON：
+      {"changes":[{"change":"...","impact":"低|中|高","recommended_tests":["..."]}]}
+      變更摘要：{{ change_log }}
+
+  # ──────────────── 05 | 軟體（SaMD/SIMD）與網路安全 ────────────────
+  - id: samd_classification
+    name: SaMD 功能分類器與安全需求清單
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: samd_class
+    system_prompt: |
+      判定軟體作為醫療器材的類型、預期用途、臨床關聯與軟體安全性目標。
+    prompt: |
+      請輸出JSON：
+      {"type":"SaMD|SIMD","intended_use":"...","risk_level":"低|中|高","security_goals":["..."]}
+      軟體摘要：{{ software_summary }}
+
+  - id: sw_lifecycle_docs_planner
+    name: 軟體生命週期文件規劃器（SDLC/變更/追溯）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 2048
+    output_key: sdlc_docs
+    system_prompt: |
+      輸出需準備的軟體文件清單：需求、架構、風險、驗證、版本控管與追溯矩陣。
+    prompt: |
+      請輸出Markdown清單，分為「必備」「加分」兩類。
+      SDLC現況：{{ sdlc_status }}
+
+  - id: cybersecurity_threat_model
+    name: 網路安全威脅模型與控制對策
+    provider: openai
     model: gpt-4o-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 臨床試驗資料分析器
-    description: 分析臨床試驗設計、結果、統計顯著性
+    max_tokens: 2048
+    output_key: cyber_model
     system_prompt: |
-      你是臨床試驗專家。
-      - 提取：試驗設計（Phase I/II/III/IV）、受試者數、主要終點
-      - 分析：療效指標、安全性數據、統計顯著性
-      - 標註研究限制與偏差風險
-    user_prompt: "請分析以下臨床試驗資料："
+      依據FDA網安期待，建構威脅模型、資產、攻擊面、控制/監測/更新策略。
+    prompt: |
+      請輸出JSON：
+      {"assets":["..."],"threats":[{"name":"...","risk":"低|中|高"}],"controls":["..."],"maintenance":["patch","SBOM","vuln mgmt"]}
+      裝置與連線摘要：{{ connectivity_profile }}
+
+  # ──────────────── 06 | 性能與驗證/驗證（V&V） ────────────────
+  - id: performance_requirements_matrix
+    name: 性能需求與測試矩陣生成器
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 2048
+    output_key: perf_matrix
+    system_prompt: |
+      從需求/標準提取可量化KPI與對應測試方法、驗收準則。
+    prompt: |
+      請輸出JSON：
+      {"requirements":[{"id":"R1","metric":"...","acceptance":"...","test_method":"..."}]}
+      需求與標準：{{ requirements_text }}
+
+  - id: bench_and_sim_validation_plan
+    name: 臨床前（台架/模擬）驗證計畫起草器
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: preclinical_plan
+    system_prompt: |
+      輸出台架、模擬、環境/耐久等驗證計畫大綱與樣本量邏輯。
+    prompt: |
+      請輸出Markdown章節（目的、方法、樣本量、驗收）。
+      性能矩陣：{{ perf_matrix }}
+
+  - id: shelf_life_and_stability_assessor
+    name: 保存期限與穩定性評估器（消耗材/植入品）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: shelf_stability
+    system_prompt: |
+      評估加速/實時老化、包材相容性、儲存條件與標示需求。
+    prompt: |
+      請輸出JSON：
+      {"aging_tests":["..."],"packaging":"...","labeling_implications":["..."]}
+      材料與包材：{{ material_packaging }}
+
+  # ──────────────── 07 | 臨床與統計 ────────────────
+  - id: clinical_evidence_strategy
+    name: 臨床證據策略設計器（非臨床/文獻/臨床）
+    provider: openai
     model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1500
-
-  - name: 藥品許可證資訊提取器
-    description: 提取許可證字號、核准日期、廠商資訊
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: clinical_strategy
     system_prompt: |
-      你是藥政法規專家。
-      - 提取：許可證字號、核准日期、有效期限
-      - 識別：製造商、進口商、國內代理商資訊
-      - 標註許可變更歷史
-    user_prompt: "請提取以下文件的許可證資訊："
+      判斷是否需要臨床研究，或以文獻/真實世界資料補強，輸出策略。
+    prompt: |
+      請輸出JSON：
+      {"need_clinical":true/false,"design_hint":"...","evidence_sources":["..."]}
+      產品與風險：{{ device_summary }}
+
+  - id: statistical_analysis_plan_builder
+    name: 統計分析計畫（SAP）生成器
+    provider: gemini
+    model: gemini-3-mini
+    temperature: 0.2
+    max_tokens: 2048
+    output_key: sap
+    system_prompt: |
+      產出主要/次要終點、樣本量估計、統計方法、缺失值處理與多中心考量。
+    prompt: |
+      請輸出Markdown大綱。
+      研究目標與終點：{{ endpoints }}
+
+  - id: postmarket_surveillance_outline
+    name: 上市後監測與真實世界證據（RWE）大綱
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.25
+    max_tokens: 1536
+    output_key: pms_outline
+    system_prompt: |
+      提出監測指標、訊號偵測、投訴處理與修補策略之框架。
+    prompt: |
+      請輸出Markdown清單。
+      風險與關鍵事件：{{ hazards }}
+
+  # ──────────────── 08 | 標示、IFU 與 UDI ────────────────
+  - id: labeling_compliance_checker
+    name: 標示與宣稱合規檢查器（21 CFR & Guidance）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: labeling_gaps
+    system_prompt: |
+      檢視標示/宣稱/警示/禁忌/注意事項是否充分且一致。
+    prompt: |
+      請輸出JSON：
+      {"gaps":[{"item":"...","severity":"低|中|高","suggestion":"..."}]}
+      標示稿：{{ labeling_text }}
+
+  - id: ifu_quality_reviewer
+    name: 使用說明書（IFU）品質審查器
+    provider: openai
     model: gpt-4o-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 800
-
-  - name: 仿單變更比對器
-    description: 比對仿單版本差異，識別重要變更
+    max_tokens: 1536
+    output_key: ifu_review
     system_prompt: |
-      你是法規文件比對專家。
-      - 識別新舊版本差異（新增、刪除、修改）
-      - 標註重要安全性變更
-      - 以對照表呈現差異
-    user_prompt: "請比對以下文件的版本差異："
+      審查步驟清晰性、警示可見性、圖示/語言一致性與可用性對齊。
+    prompt: |
+      請輸出Markdown：優點、問題、修正建議。
+      IFU草稿：{{ ifu_text }}
+
+  - id: udi_assigner_planner
+    name: UDI 指派與資料欄位規劃器（GUDID）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: udi_plan
+    system_prompt: |
+      規劃UDI載具、GUDID欄位準備與維護流程。
+    prompt: |
+      請輸出JSON：
+      {"carrier":"label|RFID|other","gudid_fields":["..."],"maintenance":"..."}
+      產品型號與包裝：{{ sku_pack }}
+
+  # ──────────────── 09 | Q-Sub 與溝通策略 ────────────────
+  - id: qsub_question_builder
+    name: Q-Sub 問題集與會議議程生成器
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.25
+    max_tokens: 1536
+    output_key: qsub_questions
+    system_prompt: |
+      產出面談議程、具體問題、備選資料請求與期望輸出。
+    prompt: |
+      請輸出Markdown清單。
+      申請重點：{{ submission_path }}
+
+  - id: reviewer_response_preparer
+    name: 審查員提問回覆草擬器（RTA/AI/Deficiency）
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: reviewer_responses
+    system_prompt: |
+      針對RTA、Additional Information、Deficiency信件，生成條目式回覆骨架與證據連結。
+    prompt: |
+      請輸出Markdown：每一問題的重點、證據、附件。
+      問題清單：{{ reviewer_questions }}
+
+  # ──────────────── 10 | 標準、指引與差距 ────────────────
+  - id: standards_applicability_mapper
+    name: 共通標準適用性映射器（IEC/ISO/ASTM）
+    provider: openai
     model: gpt-4o-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1200
-
-  - name: 特殊族群用藥分析器
-    description: 分析孕婦、哺乳、兒童、老年用藥安全性
+    max_tokens: 2048
+    output_key: std_map
     system_prompt: |
-      你是特殊族群用藥專家。
-      - 評估：孕婦安全等級、哺乳期安全性
-      - 分析：兒童用藥、老年人劑量調整
-      - 標註肝腎功能不全用藥建議
-    user_prompt: "請分析以下特殊族群用藥資訊："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
+      映射與產品相關的標準清單與適用性、豁免或替代測試建議。
+    prompt: |
+      請輸出JSON：
+      {"standards":[{"id":"IEC 60601-1","applicability":"適用|部分|不適用","justification":"..."}]}
+      產品摘要：{{ device_summary }}
 
-  - name: 藥品儲存與安定性分析器
-    description: 提取儲存條件、有效期限、安定性資料
+  - id: gap_analysis_planner
+    name: 合規差距分析與補齊計畫器
+    provider: gemini
+    model: gemini-3-mini
+    temperature: 0.2
+    max_tokens: 2048
+    output_key: gap_plan
     system_prompt: |
-      你是藥品品質管理專家。
-      - 提取：儲存溫度、濕度、光線要求
-      - 識別：有效期限、開封後效期
-      - 標註特殊儲存注意事項
-    user_prompt: "請分析以下儲存與安定性資訊："
+      整合風險、性能、標示、軟體、網安、臨床等面向之差距與優先補齊路線。
+    prompt: |
+      請輸出JSON：
+      {"gaps":[{"area":"...","severity":"低|中|高","actions":["..."]}],"timeline":"..."}
+      輸入：{{ hazards }} {{ perf_matrix }} {{ labeling_gaps }} {{ cyber_model }}
+
+  # ──────────────── 11 | 製造/品質系統（QMS/Verification） ────────────────
+  - id: qms_readiness_checker
+    name: 品質系統就緒度檢查器（QMS/21 CFR 820）
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: qms_readiness
+    system_prompt: |
+      審視設計管制、文件、CAPA、供應商管理、追溯與量測校正等就緒度。
+    prompt: |
+      請輸出JSON：
+      {"areas":[{"name":"設計管制","status":"良好|需改善","notes":"..."}]}
+      QMS摘要：{{ qms_summary }}
+
+  - id: manufacturing_process_risk
+    name: 製造流程風險與驗證需求映射器
+    provider: gemini
+    model: gemini-2.5-flash
+    temperature: 0.2
+    max_tokens: 1536
+    output_key: mfg_risk
+    system_prompt: |
+      解析關鍵製程、IQ/OQ/PQ需求與變更控制。
+    prompt: |
+      請輸出JSON：
+      {"processes":[{"name":"...","risk":"低|中|高","validation":"IQ|OQ|PQ"}]}
+      製造摘要：{{ manufacturing_summary }}
+
+  # ──────────────── 12 | 文件打包與RTA檢查 ────────────────
+  - id: submission_content_blueprinter
+    name: 上市前檔案目錄與章節藍圖生成器
+    provider: openai
     model: gpt-4o-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 800
-
-  - name: 過量與中毒處置分析器
-    description: 分析藥品過量症狀與處置方式
+    max_tokens: 2048
+    output_key: content_blueprint
     system_prompt: |
-      你是臨床毒理學專家。
-      - 識別：過量症狀、中毒機轉、致死劑量
-      - 提取：解毒劑、緊急處置、支持療法
-      - 標註需監測的生理指標
-    user_prompt: "請分析以下過量與中毒處置資訊："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1000
+      依途徑生成章節目錄：行政、裝置描述、風險、V&V、標示、臨床、軟體、網安等。
+    prompt: |
+      請輸出Markdown樹狀目錄。
+      申請途徑：{{ submission_path }}
 
-  - name: 藥品外觀辨識器
-    description: 提取藥品外觀特徵、辨識碼
-    system_prompt: |
-      你是藥品鑑別專家。
-      - 描述：形狀、顏色、大小、刻痕
-      - 提取：藥品辨識碼、包裝特徵
-      - 協助防偽辨識
-    user_prompt: "請提取以下藥品外觀資訊："
-    model: gpt-4o-mini
+  - id: rta_checklist_builder
+    name: RTA（Refuse to Accept）核對清單生成器
+    provider: gemini
+    model: gemini-2.5-flash
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 800
-
-  - name: 賦形劑分析器
-    description: 識別賦形劑成分與過敏原
+    max_tokens: 1536
+    output_key: rta_checklist
     system_prompt: |
-      你是藥劑學專家。
-      - 列出所有賦形劑成分
-      - 標註常見過敏原（乳糖、麩質等）
-      - 識別著色劑、防腐劑
-    user_prompt: "請分析以下賦形劑資訊："
-    model: gpt-4o-mini
+      建立形式審查必備項目清單與缺漏標記。
+    prompt: |
+      請輸出JSON：
+      {"items":[{"name":"封面信","status":"完成|缺漏","notes":"..."}]}
+      藍圖：{{ content_blueprint }}
+
+  # ──────────────── 13 | 數據一致性與交叉檢核 ────────────────
+  - id: cross_reference_consistency
+    name: 章節交叉一致性檢核器（數值/敘述/宣稱）
+    provider: openai
+    model: gpt-4.1-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 800
-
-  - name: 用藥指導建議生成器
-    description: 生成病人用藥指導衛教資料
+    max_tokens: 2048
+    output_key: cross_consistency
     system_prompt: |
-      你是藥師衛教專家。
-      - 以淺顯易懂語言說明用法
-      - 提供服藥時間、飲食注意
-      - 標註應就醫的警訊症狀
-    user_prompt: "請生成以下藥品的病人用藥指導："
-    model: gpt-4o-mini
-    temperature: 0.4
-    top_p: 0.9
-    max_tokens: 1000
+      檢查不同章節間數值、術語、宣稱是否一致。
+    prompt: |
+      請輸出清單：不一致項目與建議修正。
+      檔案集：{{ submission_docs }}
 
-  - name: 法規符合性檢查器
-    description: 檢查文件是否符合FDA法規要求
+  - id: deficiency_risk_predictor
+    name: 潛在審查缺失預測器（AI Letter 模擬）
+    provider: gemini
+    model: gemini-3-mini
+    temperature: 0.25
+    max_tokens: 1536
+    output_key: deficiency_risks
     system_prompt: |
-      你是藥政法規稽核專家。
-      - 檢查必要項目完整性
-      - 識別缺漏或不符合規定處
-      - 提供改善建議
-    user_prompt: "請檢查以下文件的法規符合性："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
+      根據常見缺失模式預測可能被提問或要求補件的區塊。
+    prompt: |
+      請輸出JSON：
+      {"risks":[{"topic":"...","likelihood":"低|中|高","suggested_evidence":["..."]}]}
+      目前稿件摘要：{{ submission_docs }}
 
-  - name: 風險效益評估器
-    description: 綜合評估藥品風險與效益
-    system_prompt: |
-      你是藥品風險管理專家。
-      - 量化：療效證據強度、不良反應風險
-      - 評估：風險效益比、適用族群
-      - 提供決策建議
-    user_prompt: "請評估以下藥品的風險效益："
+  # ──────────────── 14 | 法規策略與國際對齊 ────────────────
+  - id: regulatory_strategy_comparator
+    name: 法規策略比較器（FDA/IMDRF/EU MDR）
+    provider: openai
     model: gpt-4o-mini
-    temperature: 0.4
-    top_p: 0.9
-    max_tokens: 1500
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: reg_strategy_compare
+    system_prompt: |
+      比較美國與國際框架之管制差異、資料需求與協調可能。
+    prompt: |
+      請輸出Markdown差異表要點。
+      產品與風險摘要：{{ device_summary }}
 
-  - name: 學名藥生體相等性分析器
-    description: 分析學名藥與原廠藥生體相等性
-    system_prompt: |
-      你是生體相等性評估專家。
-      - 提取：BE試驗設計、AUC、Cmax數據
-      - 評估：90%信賴區間、符合性
-      - 標註溶離曲線比對結果
-    user_prompt: "請分析以下生體相等性資料："
-    model: gpt-4o-mini
+  - id: globalization_considerations
+    name: 全球化配套考量（語言、標示、電源/無線）
+    provider: gemini
+    model: gemini-2.5-flash
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 藥品經濟學分析器
-    description: 分析藥品成本效益與健保給付
+    max_tokens: 1536
+    output_key: global_consider
     system_prompt: |
-      你是藥品經濟學專家。
-      - 評估：成本效益比、QALY、ICER
-      - 分析：健保給付條件、支付價格
-      - 比較同類藥品經濟性
-    user_prompt: "請分析以下藥品經濟學資料："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
+      列出面向不同市場的額外要求（標示語言、無線認證、電源規格）。
+    prompt: |
+      請輸出JSON：
+      {"markets":[{"region":"US|EU|APAC","extra_requirements":["..."]}]}
+      規格：{{ device_spec }}
 
-  - name: 藥品回收與下架分析器
-    description: 分析藥品回收原因與影響範圍
-    system_prompt: |
-      你是藥品安全監控專家。
-      - 識別：回收等級、原因、批號
-      - 評估：影響範圍、替代方案
-      - 提供處置建議
-    user_prompt: "請分析以下藥品回收資訊："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 上市後監測資料分析器
-    description: 分析真實世界數據與上市後安全性
-    system_prompt: |
-      你是藥物流行病學專家。
-      - 分析：不良事件通報、信號偵測
-      - 評估：長期安全性、罕見風險
-      - 識別需進一步研究的議題
-    user_prompt: "請分析以下上市後監測資料："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
-
-  - name: 藥品品質檢驗標準提取器
-    description: 提取品質規格與檢驗方法
-    system_prompt: |
-      你是藥品品管專家。
-      - 提取：含量規格、純度標準
-      - 識別：檢驗方法、接受標準
-      - 標註關鍵品質屬性
-    user_prompt: "請提取以下品質檢驗標準："
-    model: gpt-4o-mini
+  # ──────────────── 15 | 成本/時間線與風險權衡 ────────────────
+  - id: submission_timeline_estimator
+    name: 申請時間線估算器（里程碑/依賴）
+    provider: openai
+    model: gpt-4.1-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 製程與製造資訊分析器
-    description: 分析製造流程與GMP符合性
+    max_tokens: 1536
+    output_key: timeline_estimate
     system_prompt: |
-      你是藥品製造專家。
-      - 描述：製程步驟、關鍵參數
-      - 評估：GMP符合性、品質控制
-      - 識別關鍵製程步驟
-    user_prompt: "請分析以下製程資訊："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1000
+      生成關鍵里程碑、依賴關係與樂觀/保守時間窗。
+    prompt: |
+      請輸出JSON：
+      {"milestones":[{"name":"...","eta_weeks":N}],"critical_path":["..."]}
+      輸入：{{ gap_plan }} {{ preclinical_plan }} {{ hfe_plan }}
 
-  - name: 藥品分類與管制級別分析器
-    description: 判定藥品分類與管制等級
+  - id: cost_and_risk_tradeoff
+    name: 成本與風險權衡分析器（測試/臨床/補件）
+    provider: gemini
+    model: gemini-3-mini
+    temperature: 0.25
+    max_tokens: 1536
+    output_key: cost_risk_tradeoff
     system_prompt: |
-      你是藥事法規分類專家。
-      - 判定：處方/指示/成藥分類
-      - 識別：管制藥品級別（1-4級）
-      - 說明管制原因與規定
-    user_prompt: "請分析以下藥品分類資訊："
+      將不同證據路徑的花費、時程、缺失風險進行比較。
+    prompt: |
+      請輸出JSON：
+      {"options":[{"path":"...","cost_estimate":"...","risk":"低|中|高","timeline_weeks":N}]}
+      輸入：{{ clinical_strategy }} {{ perf_matrix }} {{ gap_plan }}
+
+  # ──────────────── 16 | 最終整合與可讀性優化 ────────────────
+  - id: executive_summary_synthesizer
+    name: 行政摘要整合器（清晰/一致/證據鏈）
+    provider: openai
     model: gpt-4o-mini
+    temperature: 0.25
+    max_tokens: 2048
+    output_key: exec_summary
+    system_prompt: |
+      以審查友善格式濃縮核心資訊與結論，確保敘述一致性。
+    prompt: |
+      請輸出Markdown（200-400字）。
+      輸入：{{ submission_docs }} {{ se_matrix }} {{ clinical_strategy }} {{ cyber_model }}
+
+  - id: plain_language_rewriter
+    name: 平易近人語言重寫器（讀者導向）
+    provider: gemini
+    model: gemini-2.5-flash
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 800
-
-  - name: 國際藥典比對器
-    description: 比對各國藥典標準差異
+    max_tokens: 1536
+    output_key: plain_text
     system_prompt: |
-      你是國際藥典專家。
-      - 比對：USP、BP、EP、JP標準差異
-      - 識別：各國特殊要求
-      - 提供符合性建議
-    user_prompt: "請比對以下國際藥典標準："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
+      以不改變技術意義為前提，提升可讀性與條理性。
+    prompt: |
+      請重寫以下段落：
+      {{ exec_summary }}
 
-  - name: 藥品標籤與說明書檢查器
-    description: 檢查標籤說明書格式與完整性
-    system_prompt: |
-      你是藥品標示審查專家。
-      - 檢查：必要資訊完整性、格式規範
-      - 識別：字體大小、警語標示
-      - 提供修改建議
-    user_prompt: "請檢查以下標籤說明書："
-    model: gpt-4o-mini
+  - id: submission_quality_gate
+    name: 最終品質關卡檢查器（一致性/完整性/格式）
+    provider: openai
+    model: gpt-4.1-mini
     temperature: 0.2
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 藥品專利分析器
-    description: 分析藥品專利狀態與到期時間
+    max_tokens: 1536
+    output_key: quality_gate
     system_prompt: |
-      你是藥品專利分析專家。
-      - 識別：成分專利、製程專利、用途專利
-      - 分析：專利到期時間、延長狀況
-      - 評估學名藥上市時機
-    user_prompt: "請分析以下藥品專利資訊："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1000
-
-  - name: 藥品命名規範檢查器
-    description: 檢查藥品命名是否符合規範
-    system_prompt: |
-      你是藥品命名審查專家。
-      - 檢查：與既有藥品相似度
-      - 評估：混淆風險、誤用可能
-      - 提供命名建議
-    user_prompt: "請檢查以下藥品命名："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 800
-
-  - name: 臨床指引比對器
-    description: 比對藥品使用與臨床指引符合性
-    system_prompt: |
-      你是實證醫學專家。
-      - 比對：適應症與指引建議
-      - 評估：證據等級、建議強度
-      - 識別超適應症使用
-    user_prompt: "請比對以下臨床指引："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1200
-
-  - name: 藥物警戒信號偵測器
-    description: 偵測潛在安全性信號與風險模式
-    system_prompt: |
-      你是藥物警戒專家。
-      - 分析：不良事件報告模式
-      - 偵測：新興安全性信號
-      - 評估：因果關係與臨床意義
-      - 建議後續調查方向
-    user_prompt: "請分析以下藥物警戒資料："
-    model: gpt-4o-mini
-    temperature: 0.3
-    top_p: 0.9
-    max_tokens: 1500
-
-  - name: 綜合報告生成器
-    description: 整合所有分析結果生成完整報告
-    system_prompt: |
-      你是FDA文件整合專家。
-      - 彙整：前述所有代理的分析結果
-      - 生成：結構化完整報告（含執行摘要）
-      - 標註：重點發現、風險警示、建議事項
-      - 以專業格式輸出（含目錄、章節、參考資料）
-      - 提供決策支援資訊與後續追蹤建議
-    user_prompt: "請整合以下所有分析結果生成綜合報告："
-    model: gpt-4o-mini
-    temperature: 0.4
-    top_p: 0.95
-    max_tokens: 2500
+      最終檢查：引用一致、章節齊備、表格與附錄連結正確。
+    prompt: |
+      請輸出清單：通過/不通過項目與修正建議。
+      檔案集：{{ submission_docs }}

@@ -1,5 +1,3 @@
-# app.py
-
 import os
 import io
 import json
@@ -156,7 +154,7 @@ def run_chain(agents: List[Dict[str, Any]], router, base_context: Dict[str, Any]
             sys_prompt = render_template(system_prompt, context)
 
             resp = router.call(
-                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-2.5-flash"),
+                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-1.5-flash"),
                 system_prompt=sys_prompt, user_prompt=user_prompt,
                 temperature=temperature, max_tokens=max_tokens
             )
@@ -242,7 +240,7 @@ def initialize_session_state():
     st.session_state.initialized = True
     
     # --- API Keys and Sources ---
-    st.session_state.keys = {}
+    st.session_state.api_keys = {}  # FIX: Renamed from 'keys' to 'api_keys'
     st.session_state.key_sources = {}
     
     key_configs = {
@@ -253,10 +251,10 @@ def initialize_session_state():
     
     for key, env_value in key_configs.items():
         if env_value:
-            st.session_state.keys[key] = env_value
+            st.session_state.api_keys[key] = env_value  # FIX: Use 'api_keys'
             st.session_state.key_sources[key] = "env"
         else:
-            st.session_state.keys[key] = ""
+            st.session_state.api_keys[key] = ""  # FIX: Use 'api_keys'
             st.session_state.key_sources[key] = "user"
             
     # --- Other State Variables ---
@@ -284,9 +282,9 @@ def render_sidebar():
         if st.session_state.key_sources.get("GOOGLE_API_KEY") == "env":
             st.success("Gemini: Using environment key")
         else:
-            st.session_state.keys["GOOGLE_API_KEY"] = st.text_input(
+            st.session_state.api_keys["GOOGLE_API_KEY"] = st.text_input(  # FIX: Use 'api_keys'
                 "GOOGLE_API_KEY (Gemini)",
-                value=st.session_state.keys.get("GOOGLE_API_KEY", ""),
+                value=st.session_state.api_keys.get("GOOGLE_API_KEY", ""),  # FIX: Use 'api_keys'
                 type="password"
             )
 
@@ -294,9 +292,9 @@ def render_sidebar():
         if st.session_state.key_sources.get("OPENAI_API_KEY") == "env":
             st.success("OpenAI: Using environment key")
         else:
-            st.session_state.keys["OPENAI_API_KEY"] = st.text_input(
+            st.session_state.api_keys["OPENAI_API_KEY"] = st.text_input(  # FIX: Use 'api_keys'
                 "OPENAI_API_KEY (OpenAI-compatible)",
-                value=st.session_state.keys.get("OPENAI_API_KEY", ""),
+                value=st.session_state.api_keys.get("OPENAI_API_KEY", ""),  # FIX: Use 'api_keys'
                 type="password"
             )
 
@@ -304,9 +302,9 @@ def render_sidebar():
         if st.session_state.key_sources.get("XAI_API_KEY") == "env":
             st.success("Grok: Using environment key")
         else:
-            st.session_state.keys["XAI_API_KEY"] = st.text_input(
+            st.session_state.api_keys["XAI_API_KEY"] = st.text_input(  # FIX: Use 'api_keys'
                 "XAI_API_KEY (Grok)",
-                value=st.session_state.keys.get("XAI_API_KEY", ""),
+                value=st.session_state.api_keys.get("XAI_API_KEY", ""),  # FIX: Use 'api_keys'
                 type="password"
             )
             
@@ -376,9 +374,9 @@ def render_pipeline_tab(tab):
                     ag["provider"] = st.selectbox("Provider", prov_options, index=prov_options.index(ag.get("provider", "gemini")), key=f"prov_{idx}")
                     
                     model_options = {
-                        "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
-                        "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5-nano"],
-                        "grok": ["grok-3-mini", "grok-4-fast-reasoning"]
+                        "gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"],
+                        "openai": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+                        "grok": ["grok-1.5-flash", "grok-1.5"]
                     }.get(ag["provider"], [])
                     
                     ag["model"] = st.selectbox("Model", model_options, index=0, key=f"model_{idx}")
@@ -402,7 +400,7 @@ def render_run_tab(tab):
     """Renders the UI for the Run tab and executes the pipeline."""
     with tab:
         st.header("Execute")
-        keys = st.session_state.keys
+        keys = st.session_state.api_keys  # FIX: Use 'api_keys'
         agents = st.session_state.agents
         
         missing_keys = set()

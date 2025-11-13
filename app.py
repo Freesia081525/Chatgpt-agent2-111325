@@ -156,7 +156,7 @@ def run_chain(agents: List[Dict[str, Any]], router, base_context: Dict[str, Any]
             sys_prompt = render_template(system_prompt, context)
 
             resp = router.call(
-                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-1.5-flash"),
+                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-2.5-flash"),
                 system_prompt=sys_prompt, user_prompt=user_prompt,
                 temperature=temperature, max_tokens=max_tokens
             )
@@ -335,9 +335,9 @@ def render_pipeline_tab(tab):
                     ag["provider"] = st.selectbox("Provider", prov_options, index=prov_options.index(ag.get("provider", "gemini")), key=f"prov_{idx}")
                     
                     model_options = {
-                        "gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"],
-                        "openai": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-                        "grok": ["grok-1.5", "grok-1"]
+                        "gemini": ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"],
+                        "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5-nano"],
+                        "grok": ["grok-4-fast-reasoning", "grok-3-mini"]
                     }.get(ag["provider"], [])
                     
                     ag["model"] = st.selectbox("Model", model_options, index=0, key=f"model_{idx}")

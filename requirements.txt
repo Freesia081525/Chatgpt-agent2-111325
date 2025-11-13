@@ -17,7 +17,10 @@ pandas
 pyyaml
 jinja2
 numpy
-altair
 networkx
+altair
+pdf2image
+wordcloud
+matplotlib
 pyvis
 python-dotenv

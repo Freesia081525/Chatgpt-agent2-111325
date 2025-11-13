@@ -180,7 +180,7 @@ def run_chain(agents: List[Dict[str, Any]], router, base_context: Dict[str, Any]
             sys_prompt = render_template(system_prompt, context)
 
             resp = router.call(
-                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-1.5-flash"),
+                provider=agent.get("provider", "gemini"), model=agent.get("model", "gemini-2.5-flash"),
                 system_prompt=sys_prompt, user_prompt=user_prompt,
                 temperature=temperature, max_tokens=max_tokens
             )
@@ -385,7 +385,7 @@ def render_ocr_tab(tab):
                 return
 
             ocr_engine = st.selectbox("OCR Engine", 
-                                      ["pdfplumber", "pytesseract", "gemini-1.5-flash", "gpt-4o-mini"], 
+                                      ["pdfplumber", "pytesseract", "gemini-2.5-flash", "gpt-4o-mini"], 
                                       key=f"{doc_key}_ocr_engine")
             
             page_count = getattr(st.session_state, f"{doc_key}_page_count")
@@ -412,7 +412,7 @@ def render_ocr_tab(tab):
                             except Exception as e:
                                 st.error(f"Pytesseract/Poppler error: {e}. Ensure they are installed and in your system's PATH.")
 
-                        elif ocr_engine in ["gemini-1.5-flash", "gpt-4o-mini"]:
+                        elif ocr_engine in ["gemini-2.5-flash", "gpt-4o-mini"]:
                             router = ProviderRouter(google_api_key=st.session_state.api_keys.get("GOOGLE_API_KEY"),
                                                     openai_api_key=st.session_state.api_keys.get("OPENAI_API_KEY"),
                                                     xai_api_key=st.session_state.api_keys.get("XAI_API_KEY"))
@@ -482,9 +482,9 @@ def render_pipeline_tab(tab):
                     ag["provider"] = st.selectbox("Provider", prov_options, index=prov_options.index(ag.get("provider", "gemini")), key=f"prov_{idx}")
                     
                     model_options = {
-                        "gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"],
-                        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
-                        "grok": ["grok-1.5-flash", "grok-1.5"]
+                        "gemini": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5"],
+                        "openai": ["gpt-4.1-mini", "gpt-4o-mini", "gpt-5-nano", "gpt-5-chat"],
+                        "grok": ["grok-3-mini", "grok-4-fast-reasoning"]
                     }.get(ag["provider"], [])
                     
                     ag["model"] = st.selectbox("Model", model_options, index=0, key=f"model_{idx}")

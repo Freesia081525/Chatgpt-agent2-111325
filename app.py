@@ -7,7 +7,17 @@ import base64
 import re
 import pdfplumber
 import streamlit as st
+import streamlit_pdf_viewer as st_pdf_viewer
 from typing import Optional, Dict, Any, List
+
+# --- OCR & Image Processing Imports ---
+from PyPDF2 import PdfReader
+from PIL import Image
+from pdf2image import convert_from_bytes
+import pytesseract
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
 
 # --- Provider Imports ---
 import google.generativeai as genai
@@ -73,7 +83,7 @@ class ProviderRouter:
         user_prompt: str,
         temperature: float = 0.2,
         max_tokens: int = 2048,
-        images: Optional[List[str]] = None
+        images: Optional[List[bytes]] = None  # Accepts list of image bytes
     ) -> Dict[str, Any]:
         start = time.time()
         provider = (provider or "").lower()
@@ -83,9 +93,15 @@ class ProviderRouter:
         if provider == "gemini":
             genai_client = self._get_gemini()
             model_obj = genai_client.GenerativeModel(model)
+            
+            contents = [user_prompt]
+            if images:
+                for img_bytes in images:
+                    img = Image.open(io.BytesIO(img_bytes))
+                    contents.append(img)
+
             resp = model_obj.generate_content(
-                contents=[{"role": "user", "parts": [{"text": user_prompt}]}],
-                system_instruction=system_prompt,
+                contents=contents,
                 generation_config={"temperature": temperature, "max_output_tokens": max_tokens}
             )
             text = getattr(resp, "text", "") or ""
@@ -93,12 +109,21 @@ class ProviderRouter:
 
         elif provider == "openai":
             client = self._get_openai()
+            
+            messages = [{"role": "system", "content": system_prompt}]
+            user_content = [{"type": "text", "text": user_prompt}]
+            if images:
+                for img_bytes in images:
+                    b64_img = base64.b64encode(img_bytes).decode('utf-8')
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_img}"}
+                    })
+            messages.append({"role": "user", "content": user_content})
+
             resp = client.chat.completions.create(
                 model=model, temperature=temperature, max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ]
+                messages=messages
             )
             text = resp.choices[0].message.content
             usage = {
@@ -113,13 +138,13 @@ class ProviderRouter:
             chat = xai.chat.create(model=model)
             chat.append(xai_system(system_prompt))
             if images:
-                for idx, img in enumerate(images):
-                    chat.append(xai_user(f"附帶圖片 {idx+1}", xai_image(img)))
+                 for idx, img_bytes in enumerate(images):
+                    chat.append(xai_user(f"Image context {idx+1}", xai_image(img_bytes)))
             chat.append(xai_user(user_prompt))
             resp = chat.sample()
             text = resp.content
             usage = {"provider": "grok", "model": model}
-
+            
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
@@ -181,6 +206,18 @@ def run_chain(agents: List[Dict[str, Any]], router, base_context: Dict[str, Any]
 # ==============================================================================
 # viz.py Content
 # ==============================================================================
+def generate_wordcloud(text: str):
+    if not text:
+        return None
+    try:
+        wc = WordCloud(width=800, height=400, background_color='white').generate(text)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.imshow(wc, interpolation='bilinear')
+        ax.axis('off')
+        return fig
+    except Exception:
+        return None
+
 def render_keyword_bar(keywords: list):
     df = pd.DataFrame(keywords, columns=["keyword"])
     df = df.groupby("keyword").size().reset_index(name="count").sort_values("count", ascending=False)
@@ -233,14 +270,12 @@ DEFAULT_YAML_PATH = "agents.yaml"
 def initialize_session_state():
     """
     Initializes the entire session state on the very first run.
-    Uses a single flag `initialized` to prevent re-initialization.
     """
     if "initialized" in st.session_state:
-        return  # Avoid re-initializing
+        return
 
     st.session_state.initialized = True
     
-    # --- API Keys and Sources ---
     st.session_state.api_keys = {}
     st.session_state.key_sources = {}
     
@@ -251,21 +286,21 @@ def initialize_session_state():
     }
     
     for key, env_value in key_configs.items():
-        if env_value:
-            st.session_state.api_keys[key] = env_value
-            st.session_state.key_sources[key] = "env"
-        else:
-            st.session_state.api_keys[key] = ""
-            st.session_state.key_sources[key] = "user"
+        st.session_state.api_keys[key] = env_value or ""
+        st.session_state.key_sources[key] = "env" if env_value else "user"
             
+    # --- Document and OCR State ---
+    for i in ['1', '2']:
+        setattr(st.session_state, f'doc{i}_text', "")
+        setattr(st.session_state, f'doc{i}_bytes', None)
+        setattr(st.session_state, f'doc{i}_page_count', 0)
+        setattr(st.session_state, f'doc{i}_ocr_text', "")
+        setattr(st.session_state, f'doc{i}_wordcloud', None)
+
     # --- Other State Variables ---
     st.session_state.ctx = {}
     st.session_state.agents = []
     st.session_state.yaml_text = ""
-    st.session_state.doc1_text = ""
-    st.session_state.doc2_text = ""
-    st.session_state.doc1_bytes = None
-    st.session_state.doc2_bytes = None
     st.session_state.trace = []
     st.session_state.outputs = {}
     st.session_state.results_json = {}
@@ -274,100 +309,153 @@ def initialize_session_state():
     st.session_state.custom_keywords = []
 
 def render_sidebar():
-    """
-    Renders the sidebar. It conditionally shows API key input fields
-    only if the key was not found in the environment variables.
-    """
+    """Renders the sidebar with API key settings."""
     with st.sidebar:
         st.title("Settings")
         st.caption("Agentic AI Document Comparison (Streamlit)")
         st.subheader("API Keys")
         
-        # Gemini / Google
-        if st.session_state.key_sources.get("GOOGLE_API_KEY") == "env":
-            st.success("Gemini: Using environment key")
-        else:
-            st.session_state.api_keys["GOOGLE_API_KEY"] = st.text_input(
-                "GOOGLE_API_KEY (Gemini)",
-                value=st.session_state.api_keys.get("GOOGLE_API_KEY", ""),
-                type="password"
-            )
-
-        # OpenAI
-        if st.session_state.key_sources.get("OPENAI_API_KEY") == "env":
-            st.success("OpenAI: Using environment key")
-        else:
-            st.session_state.api_keys["OPENAI_API_KEY"] = st.text_input(
-                "OPENAI_API_KEY (OpenAI-compatible)",
-                value=st.session_state.api_keys.get("OPENAI_API_KEY", ""),
-                type="password"
-            )
-
-        # XAI / Grok
-        if st.session_state.key_sources.get("XAI_API_KEY") == "env":
-            st.success("Grok: Using environment key")
-        else:
-            st.session_state.api_keys["XAI_API_KEY"] = st.text_input(
-                "XAI_API_KEY (Grok)",
-                value=st.session_state.api_keys.get("XAI_API_KEY", ""),
-                type="password"
-            )
-            
+        for key_name, label in [("GOOGLE_API_KEY", "Gemini"), ("OPENAI_API_KEY", "OpenAI"), ("XAI_API_KEY", "Grok")]:
+            if st.session_state.key_sources.get(key_name) == "env":
+                st.success(f"{label}: Using environment key")
+            else:
+                st.session_state.api_keys[key_name] = st.text_input(
+                    f"{key_name} ({label})",
+                    value=st.session_state.api_keys.get(key_name, ""),
+                    type="password"
+                )
+        
         st.markdown("---")
         st.caption("Models will be selected per-agent in the Pipeline tab.")
 
 def render_documents_tab(tab):
-    """Renders the UI for the Documents tab."""
+    """Renders the UI for document upload and preview."""
     with tab:
         st.header("Documents")
         col1, col2 = st.columns(2)
 
-        def read_pdf(file) -> str:
-            try:
-                text_parts = [page.extract_text() or "" for page in pdfplumber.open(io.BytesIO(file)).pages]
-                return "\n".join(text_parts)
-            except Exception:
-                return ""
+        def setup_doc_ui(doc_num):
+            doc_key = f'doc{doc_num}'
+            st.subheader(f"Document {chr(64 + doc_num)}") # A or B
+            uploaded_file = st.file_uploader(f"Upload PDF/TXT for Document {chr(64 + doc_num)}", type=["pdf", "txt"], key=f"{doc_key}_upl")
+            
+            if uploaded_file:
+                file_bytes = uploaded_file.getvalue()
+                setattr(st.session_state, f'{doc_key}_bytes', file_bytes)
+                
+                if uploaded_file.type == "application/pdf":
+                    try:
+                        reader = PdfReader(io.BytesIO(file_bytes))
+                        setattr(st.session_state, f'{doc_key}_page_count', len(reader.pages))
+                    except Exception:
+                        setattr(st.session_state, f'{doc_key}_page_count', 0)
+                else:
+                    setattr(st.session_state, f'{doc_key}_text', file_bytes.decode("utf-8", errors="ignore"))
+            
+            with st.expander(f"Preview Document {chr(64 + doc_num)}", expanded=True):
+                doc_bytes = getattr(st.session_state, f'{doc_key}_bytes')
+                if doc_bytes:
+                    is_pdf = uploaded_file and uploaded_file.type == "application/pdf"
+                    if is_pdf:
+                        st_pdf_viewer.pdf_viewer(doc_bytes, height=400)
+                    else:
+                        st.text_area("Text Preview", getattr(st.session_state, f'{doc_key}_text'), height=300, disabled=True)
+                else:
+                    st.info("Upload a document to see a preview.")
 
         with col1:
-            st.subheader("Document A")
-            uploaded1 = st.file_uploader("Upload PDF/TXT for Document A", type=["pdf", "txt"], key="doc1_upl")
-            if uploaded1:
-                st.session_state.doc1_bytes = uploaded1.getvalue()
-                if uploaded1.name.lower().endswith(".pdf"):
-                    st.session_state.doc1_text = read_pdf(st.session_state.doc1_bytes)
-                else:
-                    st.session_state.doc1_text = st.session_state.doc1_bytes.decode("utf-8", errors="ignore")
-            
-            with st.expander("Preview Document A", expanded=True):
-                if st.session_state.doc1_bytes and "pdf" in uploaded1.type:
-                    st.write("PDF Preview:")
-                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64.b64encode(st.session_state.doc1_bytes).decode()}" width="100%" height="400"></iframe>'
-                    st.markdown(pdf_display, unsafe_allow_html=True)
-                elif st.session_state.doc1_text:
-                    st.text_area("Text Preview", st.session_state.doc1_text, height=250, disabled=True)
-                else:
-                    st.info("Upload a document to see a preview.")
-
+            setup_doc_ui(1)
         with col2:
-            st.subheader("Document B")
-            uploaded2 = st.file_uploader("Upload PDF/TXT for Document B", type=["pdf", "txt"], key="doc2_upl")
-            if uploaded2:
-                st.session_state.doc2_bytes = uploaded2.getvalue()
-                if uploaded2.name.lower().endswith(".pdf"):
-                    st.session_state.doc2_text = read_pdf(st.session_state.doc2_bytes)
-                else:
-                    st.session_state.doc2_text = st.session_state.doc2_bytes.decode("utf-8", errors="ignore")
+            setup_doc_ui(2)
 
-            with st.expander("Preview Document B", expanded=True):
-                if st.session_state.doc2_bytes and "pdf" in uploaded2.type:
-                    st.write("PDF Preview:")
-                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64.b64encode(st.session_state.doc2_bytes).decode()}" width="100%" height="400"></iframe>'
-                    st.markdown(pdf_display, unsafe_allow_html=True)
-                elif st.session_state.doc2_text:
-                    st.text_area("Text Preview", st.session_state.doc2_text, height=250, disabled=True)
-                else:
-                    st.info("Upload a document to see a preview.")
+def render_ocr_tab(tab):
+    """Renders the UI for OCR processing."""
+    with tab:
+        st.header("Document OCR")
+        st.info("Use this tab to extract text from scanned PDFs or images using OCR.")
+
+        col1, col2 = st.columns(2)
+
+        def setup_ocr_ui(doc_num):
+            doc_key = f"doc{doc_num}"
+            st.subheader(f"OCR for Document {chr(64+doc_num)}")
+            
+            if not getattr(st.session_state, f"{doc_key}_bytes"):
+                st.warning(f"Please upload Document {chr(64+doc_num)} first.")
+                return
+
+            ocr_engine = st.selectbox("OCR Engine", 
+                                      ["pdfplumber", "pytesseract", "gemini-1.5-flash", "gpt-4o-mini"], 
+                                      key=f"{doc_key}_ocr_engine")
+            
+            page_count = getattr(st.session_state, f"{doc_key}_page_count")
+            all_pages = list(range(1, page_count + 1))
+            selected_pages = st.multiselect("Select pages to OCR", all_pages, default=all_pages[:5], key=f"{doc_key}_pages")
+
+            if st.button("Run OCR", key=f"{doc_key}_run_ocr", disabled=not selected_pages):
+                with st.spinner(f"Running OCR with {ocr_engine}..."):
+                    doc_bytes = getattr(st.session_state, f"{doc_key}_bytes")
+                    ocr_text = ""
+                    try:
+                        if ocr_engine == "pdfplumber":
+                            with pdfplumber.open(io.BytesIO(doc_bytes)) as pdf:
+                                for page_num in selected_pages:
+                                    ocr_text += pdf.pages[page_num - 1].extract_text() + "\n"
+                        
+                        elif ocr_engine == "pytesseract":
+                            try:
+                                images = convert_from_bytes(doc_bytes, first_page=min(selected_pages), last_page=max(selected_pages))
+                                page_map = {i + min(selected_pages): img for i, img in enumerate(images)}
+                                for page_num in selected_pages:
+                                    if page_num in page_map:
+                                        ocr_text += pytesseract.image_to_string(page_map[page_num]) + "\n"
+                            except Exception as e:
+                                st.error(f"Pytesseract/Poppler error: {e}. Ensure they are installed and in your system's PATH.")
+
+                        elif ocr_engine in ["gemini-1.5-flash", "gpt-4o-mini"]:
+                            router = ProviderRouter(google_api_key=st.session_state.api_keys.get("GOOGLE_API_KEY"),
+                                                    openai_api_key=st.session_state.api_keys.get("OPENAI_API_KEY"),
+                                                    xai_api_key=st.session_state.api_keys.get("XAI_API_KEY"))
+                            images_bytes = []
+                            images = convert_from_bytes(doc_bytes, first_page=min(selected_pages), last_page=max(selected_pages))
+                            page_map = {i + min(selected_pages): img for i, img in enumerate(images)}
+
+                            for page_num in selected_pages:
+                                with io.BytesIO() as output:
+                                    page_map[page_num].save(output, format="PNG")
+                                    images_bytes.append(output.getvalue())
+                            
+                            provider = "gemini" if "gemini" in ocr_engine else "openai"
+                            resp = router.call(provider=provider, model=ocr_engine,
+                                             system_prompt="You are an expert OCR agent.",
+                                             user_prompt="Extract all text from the provided image(s).",
+                                             images=images_bytes)
+                            ocr_text = resp["text"]
+
+                        setattr(st.session_state, f"{doc_key}_ocr_text", ocr_text)
+                        setattr(st.session_state, f"{doc_key}_wordcloud", generate_wordcloud(ocr_text))
+
+                    except Exception as e:
+                        st.error(f"An error occurred during OCR: {e}")
+
+            ocr_result = getattr(st.session_state, f"{doc_key}_ocr_text")
+            if ocr_result:
+                st.text_area("OCR Result", ocr_result, height=200)
+                if st.button(f"Use this text for Document {chr(64+doc_num)}", key=f"{doc_key}_use_text"):
+                    setattr(st.session_state, f"{doc_key}_text", ocr_result)
+                    st.success(f"OCR text applied to Document {chr(64+doc_num)}.")
+                
+                wordcloud_fig = getattr(st.session_state, f"{doc_key}_wordcloud")
+                if wordcloud_fig:
+                    st.pyplot(wordcloud_fig)
+
+        with col1:
+            setup_ocr_ui(1)
+        with col2:
+            setup_ocr_ui(2)
+            
+# --- Other render functions (pipeline, run, summary, dashboard, yaml) remain the same ---
+# ... (omitting for brevity, as they are unchanged from the previous version) ...
 
 def render_pipeline_tab(tab):
     """Renders the UI for the Pipeline tab."""
@@ -395,7 +483,7 @@ def render_pipeline_tab(tab):
                     
                     model_options = {
                         "gemini": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"],
-                        "openai": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+                        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
                         "grok": ["grok-1.5-flash", "grok-1.5"]
                     }.get(ag["provider"], [])
                     
@@ -500,7 +588,7 @@ def render_summary_tab(tab):
                 cols[1].write(kw["color"])
                 if cols[2].button("X", key=f"del_kw_{i}"):
                     st.session_state.custom_keywords.pop(i)
-                    st.experimental_rerun()
+                    st.rerun()
 
         with col2:
             st.subheader("Interactive Agent Analysis")
@@ -635,16 +723,17 @@ def main():
 
     st.title("Agentic AI Document Comparison System")
     
-    doc_tab, pipe_tab, run_tab, summary_tab, dash_tab, yaml_tab = st.tabs([
-        "Documents", "Pipeline", "Run", "Summary", "Dashboard", "YAML"
+    tabs = st.tabs([
+        "Documents", "OCR", "Pipeline", "Run", "Summary", "Dashboard", "YAML"
     ])
     
-    render_documents_tab(doc_tab)
-    render_pipeline_tab(pipe_tab)
-    render_run_tab(run_tab)
-    render_summary_tab(summary_tab)
-    render_dashboard_tab(dash_tab)
-    render_yaml_tab(yaml_tab)
+    render_documents_tab(tabs[0])
+    render_ocr_tab(tabs[1])
+    render_pipeline_tab(tabs[2])
+    render_run_tab(tabs[3])
+    render_summary_tab(tabs[4])
+    render_dashboard_tab(tabs[5])
+    render_yaml_tab(tabs[6])
 
 if __name__ == "__main__":
     main()
